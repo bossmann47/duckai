@@ -102,7 +102,7 @@ export interface ModelsResponse {
 
 // Duck.ai specific types
 export interface VQDResponse {
-  vqd: string;
+  vqd?: string;
   hash: string;
 }
 
