@@ -1,109 +1,121 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
+import { readFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
-interface RateLimitData {
-  // Support both old and new formats for backward compatibility
-  requestCount?: number; // Old format
-  windowStart?: number; // Old format
-  requestTimestamps?: number[]; // New sliding window format
+export interface RateLimitData {
+  requestTimestamps: number[];
   lastRequestTime: number;
   isLimited: boolean;
   retryAfter?: number;
-  processId: string;
   lastUpdated: number;
 }
 
 export class RateLimitStore {
-  private readonly storeDir: string;
   private readonly storeFile: string;
-  private readonly processId: string;
+  private writeQueue: Promise<void> = Promise.resolve();
+  private pendingWrite: Omit<RateLimitData, "lastUpdated"> | null = null;
+  private writeTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
-    this.storeDir = join(tmpdir(), "duckai");
-    this.storeFile = join(this.storeDir, "rate-limit.json");
-    this.processId = `${process.pid}-${Date.now()}`;
+    const storeDir = join(tmpdir(), "duckai");
+    this.storeFile = join(storeDir, "rate-limit.json");
 
-    // Ensure directory exists
-    if (!existsSync(this.storeDir)) {
-      mkdirSync(this.storeDir, { recursive: true });
+    if (!existsSync(storeDir)) {
+      try {
+        mkdirSync(storeDir, { recursive: true });
+      } catch (error) {
+        console.warn("⚠️ Failed to create rate limit store directory:", error);
+      }
     }
   }
 
-  /**
-   * Read rate limit data from shared store
-   */
-  read(): RateLimitData | null {
+  readSync(): RateLimitData | null {
     try {
-      if (!existsSync(this.storeFile)) {
-        return null;
-      }
+      if (!existsSync(this.storeFile)) return null;
 
       const data = readFileSync(this.storeFile, "utf8");
+      if (!data.trim()) return null;
 
-      // Handle empty file
-      if (!data.trim()) {
+      const parsed = JSON.parse(data);
+
+      if (Date.now() - (parsed.lastUpdated || 0) > 5 * 60 * 1000) {
         return null;
       }
 
-      const parsed: RateLimitData = JSON.parse(data);
-
-      // Check if data is stale (older than 5 minutes)
-      const now = Date.now();
-      if (now - parsed.lastUpdated > 5 * 60 * 1000) {
-        return null;
+      if (!parsed.requestTimestamps && parsed.requestCount !== undefined) {
+        return {
+          requestTimestamps: [],
+          lastRequestTime: parsed.lastRequestTime || 0,
+          isLimited: parsed.isLimited || false,
+          retryAfter: parsed.retryAfter,
+          lastUpdated: parsed.lastUpdated || 0,
+        };
       }
 
-      return parsed;
+      return {
+        requestTimestamps: parsed.requestTimestamps || [],
+        lastRequestTime: parsed.lastRequestTime || 0,
+        isLimited: parsed.isLimited || false,
+        retryAfter: parsed.retryAfter,
+        lastUpdated: parsed.lastUpdated || 0,
+      };
     } catch (error) {
-      // Don't log warnings for expected cases like empty files
       return null;
     }
   }
 
-  /**
-   * Write rate limit data to shared store
-   */
-  write(data: Omit<RateLimitData, "processId" | "lastUpdated">): void {
-    try {
-      const storeData: RateLimitData = {
-        ...data,
-        processId: this.processId,
-        lastUpdated: Date.now(),
-      };
+  writeAsync(data: Omit<RateLimitData, "lastUpdated">): void {
+    this.pendingWrite = data;
 
-      writeFileSync(this.storeFile, JSON.stringify(storeData, null, 2));
-    } catch (error) {
-      console.warn("Failed to write rate limit store:", error);
+    if (this.writeTimeout) {
+      clearTimeout(this.writeTimeout);
     }
+
+    this.writeTimeout = setTimeout(() => {
+      this.flushToDisk();
+    }, 500);
   }
 
-  /**
-   * Update rate limit data atomically
-   */
-  update(updater: (current: RateLimitData | null) => RateLimitData): void {
-    const current = this.read();
-    const updated = updater(current);
-    this.write(updated);
+  private async flushToDisk(): Promise<void> {
+    if (!this.pendingWrite) return;
+
+    const dataToWrite = this.pendingWrite;
+    this.pendingWrite = null;
+
+    const storeData: RateLimitData = {
+      ...dataToWrite,
+      lastUpdated: Date.now(),
+    };
+
+    this.writeQueue = this.writeQueue.then(async () => {
+      try {
+        await writeFile(this.storeFile, JSON.stringify(storeData, null, 2), "utf8");
+      } catch (error) {
+        console.warn("⚠️ Failed to write rate limit store to disk:", error);
+      }
+    });
   }
 
-  /**
-   * Clear the store
-   */
-  clear(): void {
+  async flush(): Promise<void> {
+    if (this.writeTimeout) {
+      clearTimeout(this.writeTimeout);
+      this.writeTimeout = null;
+    }
+    await this.flushToDisk();
+    await this.writeQueue;
+  }
+
+  async clear(): Promise<void> {
     try {
       if (existsSync(this.storeFile)) {
-        const fs = require("fs");
-        fs.unlinkSync(this.storeFile);
+        unlinkSync(this.storeFile);
       }
     } catch (error) {
-      console.warn("Failed to clear rate limit store:", error);
+      // Ignore
     }
   }
 
-  /**
-   * Get store file path for debugging
-   */
   getStorePath(): string {
     return this.storeFile;
   }
