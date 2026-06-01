@@ -1,123 +1,79 @@
-import { OpenAIService } from "./openai-service";
+import { OpenAIService, ValidationError } from "./openai-service";
+import { randomUUID } from "node:crypto";
 
 const openAIService = new OpenAIService();
 
 const server = Bun.serve({
   port: process.env.PORT || 3000,
-  async fetch(req) {
-    const url = new URL(req.url);
+  hostname: process.env.HOST || "0.0.0.0",
 
-    // CORS headers
+  async fetch(req) {
+    const startTime = Date.now();
+    const url = new URL(req.url);
+    const requestId = randomUUID().split("-")[0];
+
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "X-Request-ID": requestId,
     };
 
-    // Handle preflight requests
-    if (req.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
+    if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
     try {
-      // Health check endpoint
       if (url.pathname === "/health" && req.method === "GET") {
-        return new Response(JSON.stringify({ status: "ok" }), {
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        });
+        return new Response(JSON.stringify({ status: "ok" }), { headers: { "Content-Type": "application/json", ...corsHeaders } });
       }
 
-      // Models endpoint
       if (url.pathname === "/v1/models" && req.method === "GET") {
-        const models = openAIService.getModels();
-        return new Response(JSON.stringify(models), {
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        });
+        return new Response(JSON.stringify(openAIService.getModels()), { headers: { "Content-Type": "application/json", ...corsHeaders } });
       }
 
-      // Chat completions endpoint
       if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-        const body = await req.json();
+        let body: any;
+        try { body = await req.json(); } catch (e) { throw new ValidationError("Invalid JSON payload"); }
+
         const validatedRequest = openAIService.validateRequest(body);
 
-        // Handle streaming
         if (validatedRequest.stream) {
-          const stream =
-            await openAIService.createChatCompletionStream(validatedRequest);
-          return new Response(stream, {
-            headers: {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              Connection: "keep-alive",
-              ...corsHeaders,
-            },
-          });
+          const stream = await openAIService.createChatCompletionStream(validatedRequest);
+          console.log(`[${requestId}] 🌊 Streaming response for model: ${validatedRequest.model}`);
+          return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders } });
         }
 
-        // Handle non-streaming
-        const completion =
-          await openAIService.createChatCompletion(validatedRequest);
-        return new Response(JSON.stringify(completion), {
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        });
+        const completion = await openAIService.createChatCompletion(validatedRequest);
+        console.log(`[${requestId}] ✅ Completed in ${Date.now() - startTime}ms (Model: ${validatedRequest.model})`);
+        return new Response(JSON.stringify(completion), { headers: { "Content-Type": "application/json", ...corsHeaders } });
       }
 
-      // 404 for unknown endpoints
-      return new Response(
-        JSON.stringify({
-          error: {
-            message: "Not found",
-            type: "invalid_request_error",
-          },
-        }),
-        {
-          status: 404,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
-      );
-    } catch (error) {
-      console.error("Server error:", error);
+      return new Response(JSON.stringify({ error: { message: "Not found", type: "invalid_request_error" } }), { status: 404, headers: { "Content-Type": "application/json", ...corsHeaders } });
 
-      const errorMessage =
-        error instanceof Error ? error.message : "Internal server error";
-      const statusCode =
-        errorMessage.includes("required") || errorMessage.includes("must")
-          ? 400
-          : 500;
+    } catch (error: any) {
+      console.error(`[${requestId}] ❌ Error:`, error.message || error);
+      let statusCode = 500; let errorType = "internal_server_error"; let errorMessage = "An unexpected server error occurred";
 
-      return new Response(
-        JSON.stringify({
-          error: {
-            message: errorMessage,
-            type:
-              statusCode === 400
-                ? "invalid_request_error"
-                : "internal_server_error",
-          },
-        }),
-        {
-          status: statusCode,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
-      );
+      if (error instanceof ValidationError) {
+        statusCode = 400; errorType = "invalid_request_error"; errorMessage = error.message;
+      } else if (error.message && (error.message.includes("Rate limited") || error.message.includes("418") || error.message.includes("429"))) {
+        statusCode = 429; errorType = "rate_limit_error"; errorMessage = "Rate limit exceeded.";
+      } else if (error instanceof Error) {
+        errorMessage = error.message;
+      }
+
+      return new Response(JSON.stringify({ error: { message: errorMessage, type: errorType } }), { status: statusCode, headers: { "Content-Type": "application/json", ...corsHeaders } });
     }
   },
 });
 
-console.log(
-  `🚀 OpenAI-compatible server running on http://localhost:${server.port}`
-);
-console.log(`📚 Available endpoints:`);
-console.log(`  GET  /health - Health check`);
-console.log(`  GET  /v1/models - List available models`);
-console.log(
-  `  POST /v1/chat/completions - Chat completions (streaming & non-streaming)`
-);
-console.log(`\n🔧 Example usage:`);
-console.log(
-  `curl -X POST http://localhost:${server.port}/v1/chat/completions \\`
-);
-console.log(`  -H "Content-Type: application/json" \\`);
-console.log(
-  `  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello!"}]}'`
-);
+console.log(`\n🚀 DuckAI OpenAI-compatible server running on http://${server.hostname}:${server.port}\n`);
+
+const shutdown = async () => {
+  console.log("\n🛑 Shutting down server gracefully...");
+  await openAIService.shutdown();
+  server.stop(true);
+  process.exit(0);
+};
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
